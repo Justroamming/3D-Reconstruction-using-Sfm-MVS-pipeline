@@ -1,0 +1,16 @@
+# Python cache and build artifacts
+MVS/__pycache__
+SFM/__pycache__
+
+# Archived project bundles
+MVS/MVS.zip
+SFM/files.zip
+
+# Generated reconstruction outputs
+mvs_output
+sparse
+
+# Input / calibration data files
+calibration_format_4x_data.json
+custom4_dense.txt
+custom4sparse.txt
