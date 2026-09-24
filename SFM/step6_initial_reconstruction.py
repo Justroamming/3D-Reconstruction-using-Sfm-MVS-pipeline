@@ -234,7 +234,8 @@ def initialize_reconstruction(
     seed_selector: Optional[SeedPairSelectorBase] = None,
     pose_recoverer: Optional[InitialPoseRecovererBase] = None,
     max_reproj_error: float = 4.0,
-    min_triangulation_angle_deg: float = 0.5,
+    min_triangulation_angle_deg: float = 2.0,
+    seed_pair: Optional[Tuple[int, int]] = None,   # NEW
 ) -> bool:
     """
     Step 6 — Select seed pair and build initial two-view reconstruction.
@@ -267,11 +268,14 @@ def initialize_reconstruction(
           f"pose: {pose_recoverer.__class__.__name__}")
 
     # --- 6a. Seed pair selection ---
-    try:
-        selected_pair = normalize_pair_key(*seed_selector.select(reconstruction))
-    except (ValueError, KeyError) as e:
-        print(f"[Step 6] Seed selection failed: {e}")
-        return False
+    if seed_pair is not None:                                   # NEW branch
+        selected_pair = normalize_pair_key(*seed_pair)
+    else:
+        try:
+            selected_pair = normalize_pair_key(*seed_selector.select(reconstruction))
+        except (ValueError, KeyError) as e:
+            print(f"[Step 6] Seed selection failed: {e}")
+            return False
 
     candidate_pairs = list(reconstruction.verified_matches.keys())
     candidate_pairs = [selected_pair] + [pair for pair in candidate_pairs if pair != selected_pair]
@@ -385,3 +389,68 @@ def initialize_reconstruction(
 
     print("[Step 6] No seed pair produced valid triangulated points.")
     return False
+
+def select_disjoint_seeds(
+    reconstruction: Reconstruction,
+    seed_selector: Optional[SeedPairSelectorBase] = None,
+    max_seeds: Optional[int] = None,
+    min_pair_inliers: int = 50,
+) -> List[Tuple[int, int]]:
+    """
+    Repeatedly run `seed_selector` over a shrinking pool of verified matches,
+    excluding images already claimed by a previous seed, to find several
+    mutually-disjoint seed pairs suitable for independent components.
+
+    Parameters
+    ----------
+    reconstruction    : SfM state with verified_matches already populated
+    seed_selector     : SeedPairSelectorBase (default: HomographyRatioSeedSelector)
+    max_seeds         : stop after this many seeds (None = keep going until
+                         no more disjoint pairs qualify)
+    min_pair_inliers  : minimum verified inliers required to accept a pair as
+                         a new seed (guards against weak leftover pairs)
+
+    Returns
+    -------
+    seeds : list of (image_id_a, image_id_b), no image id repeated across pairs
+    """
+    if seed_selector is None:
+        seed_selector = HomographyRatioSeedSelector()
+
+    used_images: set = set()
+    seeds: List[Tuple[int, int]] = []
+
+    while max_seeds is None or len(seeds) < max_seeds:
+        filtered_vm = {
+            pair: vm for pair, vm in reconstruction.verified_matches.items()
+            if pair[0] not in used_images and pair[1] not in used_images
+        }
+        if not filtered_vm:
+            break
+
+        # Minimal view sharing global data but with the filtered match pool,
+        # so the (unmodified) seed_selector only ever sees unclaimed images.
+        view = Reconstruction()
+        view.keypoints = reconstruction.keypoints
+        view.cameras = reconstruction.cameras
+        view.verified_matches = filtered_vm
+
+        try:
+            pair = normalize_pair_key(*seed_selector.select(view))
+        except (ValueError, KeyError):
+            break
+
+        vm = filtered_vm.get(pair)
+        if vm is None or vm.num_inliers < min_pair_inliers:
+            break
+
+        seeds.append(pair)
+        used_images.add(pair[0])
+        used_images.add(pair[1])
+        print(f"[Step 6] Seed #{len(seeds)}: images {pair[0]}<->{pair[1]}  "
+              f"({vm.num_inliers} inliers)")
+
+    if not seeds:
+        print("[Step 6] select_disjoint_seeds: no valid seed pairs found.")
+
+    return seeds

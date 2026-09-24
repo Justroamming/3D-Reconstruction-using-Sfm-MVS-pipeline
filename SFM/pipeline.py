@@ -34,7 +34,11 @@ from step3_feature_matching   import PairSelectorBase, DescriptorMatcherBase, ma
 from step4_geometric_verification import GeometricVerifierBase, verify_matches
 from step5_camera_intrinsics  import EXIFIntrinsicsEstimator, IntrinsicsEstimatorBase, estimate_intrinsics
 from step6_initial_reconstruction import (
-    SeedPairSelectorBase, InitialPoseRecovererBase, initialize_reconstruction
+    SeedPairSelectorBase, InitialPoseRecovererBase,
+    initialize_reconstruction, select_disjoint_seeds,   # NEW: select_disjoint_seeds
+)
+from step6b_component_merging import (                  # NEW file
+    ComponentMergerBase, UmeyamaRANSACMerger, merge_components
 )
 from step7_camera_registration import (
     NextViewSelectorBase, PnPSolverBase, register_next_image
@@ -79,8 +83,13 @@ class SfMPipelineConfig:
     # --- Step 6: Initial reconstruction ---
     seed_selector:   Optional[SeedPairSelectorBase]     = None
     pose_recoverer:  Optional[InitialPoseRecovererBase] = None
-    max_reproj_init: float = 1.0
-    min_angle_init:  float = 0.5
+    max_reproj_init: float = 4.0
+    min_angle_init:  float = 3.0
+    max_seeds:        Optional[int] = None    # NEW: cap on # of independent components (None = unlimited)
+    min_seed_inliers: int = 50                # NEW: floor for accepting an additional seed
+
+    # --- Step 6b: Component merging ---
+    component_merger: Optional[ComponentMergerBase] = None   # NEW
 
     # --- Step 7: Camera registration ---
     view_selector:    Optional[NextViewSelectorBase] = None
@@ -89,8 +98,8 @@ class SfMPipelineConfig:
 
     # --- Step 8: Triangulation ---
     triangulator:     Optional[TriangulatorBase] = None
-    max_reproj_tri:   float = 1.0
-    min_angle_tri:    float = 0.5
+    max_reproj_tri:   float = 4.0
+    min_angle_tri:    float = 3.0
 
     # --- Step 9: Bundle adjustment ---
     bundle_adjuster:    Optional[BundleAdjusterBase] = None
@@ -126,7 +135,7 @@ class SfMPipeline:
     def run(self) -> Reconstruction:
         """Execute the full incremental SfM pipeline."""
         cfg = self.config
-        recon = self.reconstruction
+        dataset = self.reconstruction   # holds global, dataset-level data
 
         t0 = time.time()
         print("=" * 60)
@@ -135,111 +144,150 @@ class SfMPipeline:
 
         # ── Step 1: Load images ─────────────────────────────────────
         images, exif_list = load_images(
-            cfg.image_dir, recon,
+            cfg.image_dir, dataset,
             loader=cfg.loader,
             preprocessor=cfg.preprocessor,
         )
 
         # ── Step 2: Feature extraction ───────────────────────────────
-        extract_features(images, recon, extractor=cfg.feature_extractor)
+        extract_features(images, dataset, extractor=cfg.feature_extractor)
 
         # ── Step 3: Feature matching ─────────────────────────────────
         match_features(
-            recon,
+            dataset,
             pair_selector=cfg.pair_selector,
             matcher=cfg.matcher,
             min_matches=cfg.min_matches,
         )
 
         # ── Step 4: Geometric verification ───────────────────────────
-        verify_matches(recon, verifier=cfg.verifier, min_inliers=cfg.min_inliers)
+        verify_matches(dataset, verifier=cfg.verifier, min_inliers=cfg.min_inliers)
 
-        if not recon.verified_matches:
+        if not dataset.verified_matches:
             print("ERROR: No verified matches found. Aborting.")
-            return recon
+            return dataset
 
         # ── Step 5: Camera intrinsics ─────────────────────────────────
         estimate_intrinsics(
-            images, exif_list, recon,
+            images, exif_list, dataset,
             estimator=cfg.intrinsics_estimator,
             shared_camera=cfg.shared_camera,
         )
 
         # ── Step 6: Initial two-view reconstruction ───────────────────
-        ok = initialize_reconstruction(
-            images, recon,
+        seeds = select_disjoint_seeds(
+            dataset,
             seed_selector=cfg.seed_selector,
-            pose_recoverer=cfg.pose_recoverer,
-            max_reproj_error=cfg.max_reproj_init,
-            min_triangulation_angle_deg=cfg.min_angle_init,
+            max_seeds=cfg.max_seeds,
+            min_pair_inliers=cfg.min_seed_inliers,
         )
-        if not ok:
+        if not seeds:
             print("ERROR: Initial reconstruction failed. Aborting.")
-            return recon
+            return dataset
 
-        # Run BA on seed pair
-        run_bundle_adjustment(recon, adjuster=cfg.bundle_adjuster)
-        filter_outliers(recon, point_filter=cfg.point_filter)
 
         # ── Steps 7–10: Incremental growth ───────────────────────────
         n_total = len(images)
-        n_registered = 2   # seed pair
-        images_since_ba = 0
+        components = []
 
+        for seed_idx, seed_pair in enumerate(seeds):
+            print(f"\n{'─'*60}")
+            print(f"  Component {seed_idx+1}/{len(seeds)}  seed={seed_pair}")
+            print(f"{'─'*60}")
+
+            comp = dataset.spawn_component(component_id=seed_idx)
+
+            ok = initialize_reconstruction(
+                images, comp,
+                seed_selector=cfg.seed_selector,
+                pose_recoverer=cfg.pose_recoverer,
+                max_reproj_error=cfg.max_reproj_init,
+                min_triangulation_angle_deg=cfg.min_angle_init,
+                seed_pair=seed_pair,
+            )
+            if not ok:
+                print(f"  Component {seed_idx+1}: seed initialization failed, skipping.")
+                continue
+
+            run_bundle_adjustment(comp, adjuster=cfg.bundle_adjuster)
+            filter_outliers(comp, point_filter=cfg.point_filter)
+
+            n_registered = 2
+            images_since_ba = 0
+
+            while n_registered < n_total:
+                # Step 7: Register next image
+                new_id = register_next_image(
+                    comp,
+                    view_selector=cfg.view_selector,
+                    pnp_solver=cfg.pnp_solver,
+                    min_inliers=cfg.min_pnp_inliers,
+                )
+
+                if new_id is None:
+                    print("No more images can be registered. Stopping.")
+                    break
+
+                # Step 8: Triangulate new points
+                triangulate_new_points(
+                    new_id, images, comp,
+                    triangulator=cfg.triangulator,
+                    max_reproj_error=cfg.max_reproj_tri,
+                    min_triangulation_angle_deg=cfg.min_angle_tri,
+                )
+
+                n_registered += 1
+                images_since_ba += 1
+
+                # Step 9: Bundle adjustment (periodic)
+                if images_since_ba >= cfg.ba_every_n_images:
+                    run_bundle_adjustment(comp, adjuster=cfg.bundle_adjuster)
+                    filter_outliers(comp, point_filter=cfg.point_filter)
+                    images_since_ba = 0
+
+                print(f"  Component {seed_idx+1} progress: {n_registered} registered "
+                    f"| {len(comp.points3d)} 3-D points")
+
+            run_bundle_adjustment(comp, adjuster=cfg.bundle_adjuster)
+            filter_outliers(comp, point_filter=cfg.point_filter)
+            components.append(comp)
+
+        if not components:
+            print("ERROR: No component successfully initialized. Aborting.")
+            return dataset    
+
+        # ── Step 6b: Merge components ───────────────────────────────────
         print(f"\n{'─'*60}")
-        print(f"  Incremental growth  ({n_total - 2} images remaining)")
+        print("  Merging components")
         print(f"{'─'*60}")
+        merged = merge_components(components, dataset.verified_matches, merger=cfg.component_merger)
 
-        while n_registered < n_total:
-            # Step 7: Register next image
-            new_id = register_next_image(
-                recon,
-                view_selector=cfg.view_selector,
-                pnp_solver=cfg.pnp_solver,
-                min_inliers=cfg.min_pnp_inliers,
-            )
-
-            if new_id is None:
-                print("No more images can be registered. Stopping.")
-                break
-
-            # Step 8: Triangulate new points
-            triangulate_new_points(
-                new_id, images, recon,
-                triangulator=cfg.triangulator,
-                max_reproj_error=cfg.max_reproj_tri,
-                min_triangulation_angle_deg=cfg.min_angle_tri,
-            )
-
-            n_registered += 1
-            images_since_ba += 1
-
-            # Step 9: Bundle adjustment (periodic)
-            if images_since_ba >= cfg.ba_every_n_images:
-                run_bundle_adjustment(recon, adjuster=cfg.bundle_adjuster)
-                filter_outliers(recon, point_filter=cfg.point_filter)
-                images_since_ba = 0
-
-            print(f"  Progress: {n_registered}/{n_total} registered  "
-                  f"| {len(recon.points3d)} 3-D points")
-
+        merged.sort(key=lambda c: len(c.registered_images), reverse=True)
+        final = merged[0]
+        if len(merged) > 1:
+            print(f"  WARNING: {len(merged)} disconnected components remain "
+                  f"(no shared structure found between them). "
+                  f"Exporting the largest ({len(final.registered_images)} cameras); "
+                  f"others are discarded.")
+            
         # ── Final BA + filter ─────────────────────────────────────────
         print(f"\n{'─'*60}")
         print("  Final bundle adjustment")
         print(f"{'─'*60}")
-        run_bundle_adjustment(recon, adjuster=cfg.bundle_adjuster)
-        filter_outliers(recon, point_filter=cfg.point_filter)
+        run_bundle_adjustment(final, adjuster=cfg.bundle_adjuster)
+        filter_outliers(final, point_filter=cfg.point_filter)
 
         # ── Step 11: Export ───────────────────────────────────────────
-        export_reconstruction(recon, cfg.output_dir, exporter=cfg.exporter)
+        export_reconstruction(final, cfg.output_dir, exporter=cfg.exporter)
 
         elapsed = time.time() - t0
         print(f"\n{'='*60}")
-        print(f"  DONE  {len(recon.registered_images)} cameras  "
-              f"{len(recon.points3d)} points  [{elapsed:.1f}s]")
+        print(f"  DONE  {len(final.registered_images)} cameras  "
+              f"{len(final.points3d)} points  [{elapsed:.1f}s]")
         print(f"{'='*60}")
-
-        return recon
+        
+        self.reconstruction = final
+        return final    
 
 
 # ============================================================
@@ -267,7 +315,7 @@ if __name__ == "__main__":
     pipeline = SfMPipeline(image_dir="your_images_directory/", 
                            output_dir="your_sparse_directory/",
                            preprocessor=None,
-                           pair_selector=SequentialPairSelector(),
+                           pair_selector=SequentialPairSelector(window=5, wraparound=True),
                            matcher=BFMatcher(),
                            verifier=FundamentalRANSAC(),
                            intrinsics_estimator=EXIFIntrinsicsEstimator(),

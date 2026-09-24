@@ -24,6 +24,9 @@ from typing import List, Optional, Tuple
 from sfm_types import Keypoints, Reconstruction
 
 
+_AKAZE_DESCRIPTOR_MLDB = getattr(cv2, "AKAZE_DESCRIPTOR_MLDB", 5)
+
+
 # ============================================================
 #  INTERFACE
 # ============================================================
@@ -158,13 +161,18 @@ class AKAZEExtractor(FeatureExtractorBase):
 
     def __init__(
         self,
-        descriptor_type: int = cv2.AKAZE_DESCRIPTOR_MLDB,
+        descriptor_type: int = _AKAZE_DESCRIPTOR_MLDB,
         descriptor_size: int = 0,       # 0 = full size
         descriptor_channels: int = 3,
         threshold: float = 0.001,
         n_octaves: int = 4,
         n_octave_layers: int = 4,
     ):
+        if not hasattr(cv2, "AKAZE_create"):
+            raise RuntimeError(
+                "AKAZE is unavailable in the installed OpenCV build; "
+                "use SIFT/ORB or install an OpenCV build with AKAZE support."
+            )
         self.akaze = cv2.AKAZE_create(
             descriptor_type=descriptor_type,
             descriptor_size=descriptor_size,

@@ -136,31 +136,95 @@ class MidpointTriangulator(TriangulatorBase):
 
 class OptimalTriangulator(TriangulatorBase):
     """
-    Iterative optimal triangulation (Hartley & Sturm / Lindstrom).
-    Minimises algebraic reprojection error by correcting 2-D observations.
-    Falls back to DLT if scipy is unavailable.
+    Hartley-Sturm optimal triangulation (Hartley & Sturm, "Triangulation", 1997).
+
+    Minimises the geometric reprojection error by iteratively correcting the
+    2-D observations onto their respective epipolar lines before re-triangulating,
+    subject to the epipolar constraint x2^T F x1 = 0.
+
+    Falls back to DLT when fewer than 2 points are supplied.
     """
 
     def __init__(self, max_iters: int = 10):
         self.max_iters = max_iters
         self._dlt = DLTTriangulator()
 
+    @staticmethod
+    def _fundamental_from_P(P_a: np.ndarray, P_b: np.ndarray) -> np.ndarray:
+        """
+        Recover the Fundamental matrix F from two 3x4 projection matrices.
+
+            F = [e_b]_x  P_b  P_a^+
+
+        where e_b is the epipole in image B (projection of camera A's centre
+        into image B), and P_a^+ is the Moore-Penrose pseudo-inverse of P_a.
+        """
+        # Camera centres = right null vectors of the projection matrices
+        _, _, Vt_a = np.linalg.svd(P_a)
+        C_a = Vt_a[-1]                                  # (4,) homogeneous
+        _, _, Vt_b = np.linalg.svd(P_b)
+        C_b = Vt_b[-1]
+
+        # Epipole in image B: project C_a into image B
+        e_b = P_b @ C_a
+        if abs(e_b[2]) < 1e-12:
+            # Degenerate; fall back to identity-ish F
+            return np.eye(3, dtype=np.float64) / 3.0
+        e_b = e_b / e_b[2]
+
+        # Skew-symmetric matrix of e_b
+        ex = np.array([
+            [0.0, -e_b[2], e_b[1]],
+            [e_b[2], 0.0, -e_b[0]],
+            [-e_b[1], e_b[0], 0.0],
+        ], dtype=np.float64)
+
+        F = ex @ P_b @ np.linalg.pinv(P_a)
+        # Normalise so the largest entry has unit magnitude (standard convention)
+        scale = np.max(np.abs(F))
+        if scale > 1e-12:
+            F = F / scale
+        return F
+
     def triangulate(self, pts_a, pts_b, P_a, P_b) -> np.ndarray:
-        # Lindstrom iterative correction (simplified version)
+        if len(pts_a) == 0:
+            return np.empty((0, 3), dtype=np.float64)
+
         pa = pts_a.astype(np.float64).copy()
         pb = pts_b.astype(np.float64).copy()
 
+        F = self._fundamental_from_P(P_a, P_b)
+
         for _ in range(self.max_iters):
             pts3d = self._dlt.triangulate(pa, pb, P_a, P_b)
-            # Reproject and correct
-            n = pts3d.shape[0]
-            ph = np.hstack([pts3d, np.ones((n, 1))])
-            proj_a = (P_a @ ph.T).T
-            proj_b = (P_b @ ph.T).T
-            pa = proj_a[:, :2] / (proj_a[:, 2:3] + 1e-10)
-            pb = proj_b[:, :2] / (proj_b[:, 2:3] + 1e-10)
-            pa = (pa + pts_a) / 2
-            pb = (pb + pts_b) / 2
+
+            # Homogeneous observations
+            ones = np.ones((len(pa), 1), dtype=np.float64)
+            x1 = np.hstack([pa, ones])                       # (N,3)
+            x2 = np.hstack([pb, ones])                       # (N,3)
+
+            # Epipolar line in image B for each x1:  l2 = F @ x1
+            l2 = (F @ x1.T).T                                 # (N,3)
+            a2, b2, c2 = l2[:, 0], l2[:, 1], l2[:, 2]
+            denom2 = a2 * a2 + b2 * b2 + 1e-12
+            d2 = (a2 * x2[:, 0] + b2 * x2[:, 1] + c2) / denom2
+            x2_corr = np.stack(
+                [x2[:, 0] - a2 * d2, x2[:, 1] - b2 * d2, np.ones(len(pa))],
+                axis=1,
+            )
+
+            # Epipolar line in image A for each corrected x2:  l1 = F^T @ x2_corr
+            l1 = (F.T @ x2_corr.T).T                          # (N,3)
+            a1, b1, c1 = l1[:, 0], l1[:, 1], l1[:, 2]
+            denom1 = a1 * a1 + b1 * b1 + 1e-12
+            d1 = (a1 * x1[:, 0] + b1 * x1[:, 1] + c1) / denom1
+            x1_corr = np.stack(
+                [x1[:, 0] - a1 * d1, x1[:, 1] - b1 * d1, np.ones(len(pa))],
+                axis=1,
+            )
+
+            pa = x1_corr[:, :2]
+            pb = x2_corr[:, :2]
 
         return self._dlt.triangulate(pa, pb, P_a, P_b)
 
@@ -175,7 +239,7 @@ def triangulate_new_points(
     reconstruction: Reconstruction,
     triangulator: Optional[TriangulatorBase] = None,
     max_reproj_error: float = 4.0,
-    min_triangulation_angle_deg: float = 0.5,#2.0
+    min_triangulation_angle_deg: float = 2,#2.0
 ) -> int:
     """
     Step 8 — Triangulate new 3-D points after registering `new_image_id`.

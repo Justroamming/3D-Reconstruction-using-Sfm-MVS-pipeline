@@ -136,8 +136,30 @@ class Reconstruction:
 
     # --- bookkeeping ---
     next_point_id: int = 0
+    component_id: Optional[int] = None   # NEW: informational, which seed this grew from
 
     def new_point_id(self) -> int:
         pid = self.next_point_id
         self.next_point_id += 1
         return pid
+
+    def spawn_component(self, component_id: Optional[int] = None) -> "Reconstruction":
+        """
+        Create a new, independent Reconstruction that shares this dataset's
+        global, read-only data (image_paths, cameras, keypoints, matches) but
+        starts with EMPTY per-component state (registered_images, points3d).
+
+        Used for multi-seed incremental reconstruction: each component grows
+        its own registered_images/points3d independently while reading from
+        the same underlying feature/match data. Safe because Steps 7-10 never
+        mutate cameras/keypoints/verified_matches, only registered_images and
+        points3d (which are fresh, unshared dicts here).
+        """
+        comp = Reconstruction()
+        comp.image_paths = self.image_paths
+        comp.cameras = self.cameras
+        comp.keypoints = self.keypoints
+        comp.image_matches = self.image_matches
+        comp.verified_matches = self.verified_matches
+        comp.component_id = component_id
+        return comp
