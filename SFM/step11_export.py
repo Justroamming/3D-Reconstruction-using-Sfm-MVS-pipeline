@@ -228,7 +228,15 @@ class COLMAPExporter(ExporterBase):
                 for pid, p3d in reconstruction.points3d.items():
                     x, y, z = p3d.xyz
                     r, g, b = p3d.color[:3]
-                    track_str = " ".join(f"{obs_id} {kp_idx}" for obs_id, kp_idx in p3d.track)
+                    # COLMAP format: TRACK[] = IMAGE_ID X Y POINT3D_ID ...
+                    track_entries = []
+                    for (obs_id, kp_idx) in p3d.track:
+                        kp = reconstruction.keypoints.get(obs_id)
+                        if kp is None or kp_idx >= len(kp.points):
+                            continue
+                        px, py = kp.points[kp_idx]
+                        track_entries.append(f"{obs_id} {px:.2f} {py:.2f} {pid}")
+                    track_str = " ".join(track_entries)
                     f.write(f"{pid} {x:.6f} {y:.6f} {z:.6f} {r} {g} {b} "
                             f"{p3d.error:.4f} {track_str}\n")
         except IOError as e:
@@ -275,14 +283,14 @@ class NVMExporter(ExporterBase):
                 for p3d in pts:
                     x, y, z = p3d.xyz
                     r, g, b = p3d.color[:3]
-                    # Track
+                    # NVM format: TRACK[] = IMAGE_INDEX X Y ...
                     track_entries = []
                     for (obs_id, kp_idx) in p3d.track:
                         kp = reconstruction.keypoints.get(obs_id)
                         if kp is None or kp_idx >= len(kp.points):
                             continue
                         px, py = kp.points[kp_idx]
-                        track_entries.append(f"{obs_id} {kp_idx} {px:.2f} {py:.2f}")
+                        track_entries.append(f"{obs_id} {px:.2f} {py:.2f}")
                     track_str = " ".join(track_entries)
                     f.write(f"{x:.6f} {y:.6f} {z:.6f} {r} {g} {b} "
                             f"{len(track_entries)} {track_str}\n")
