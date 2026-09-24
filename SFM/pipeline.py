@@ -326,7 +326,7 @@ if __name__ == "__main__":
                            triangulator=DLTTriangulator(),
                            bundle_adjuster=SciPyBundleAdjuster(),
                            point_filter=ReprojectionFilter(),
-                           exporter=COLMAPExporter())
+                           exporter=None,)
     recon = pipeline.run()
 
     # ── Example: customise individual steps ──────────────────────────
