@@ -52,15 +52,22 @@ class SequentialPairSelector(PairSelectorBase):
     Best for video or spatially ordered capture.
     """
 
-    def __init__(self, window: int = 5):
+    def __init__(self, window: int = 5, wraparound: bool = False):
         self.window = window
+        self.wraparound = wraparound    
 
     def select_pairs(self, n_images: int) -> List[Tuple[int, int]]:
         pairs = []
         for i in range(n_images):
-            for j in range(i + 1, min(i + 1 + self.window, n_images)):
-                pairs.append((i, j))
-        return pairs
+            for offset in range(1, self.window + 1):
+                j = i + offset
+                if j < n_images:
+                    pairs.append((i, j))
+                elif self.wraparound:
+                    j_wrapped = j - n_images
+                    if j_wrapped < i:  # avoid self-pair / dup when window >= n_images
+                        pairs.append((j_wrapped, i))
+        return sorted(set(tuple(sorted(p)) for p in pairs))
 
 
 class VocabTreePairSelector(PairSelectorBase):
